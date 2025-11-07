@@ -1,2 +1,15 @@
 # chain
 On-Chain Utilities and Hub
+
+```
+RUSTFLAGS="-C target-cpu=native" cargo test --release
+RUSTFLAGS="-C target-cpu=native" cargo run --release
+```
+
+```
+bintree/rs_0
+10m elements initial | 55409 ms
+10k update | 6 ms
+
+Possibly improvements to segment state/ tx/ contract/account/<pk> into seperate branchs (so hot accounts dont thrash the entire tree)
+```
