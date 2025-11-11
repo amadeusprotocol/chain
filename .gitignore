@@ -1,0 +1,7 @@
+node_modules
+build
+target
+*.ptau
+*.zkey
+.env
+.DS_Store

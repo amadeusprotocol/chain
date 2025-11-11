@@ -1,0 +1,25 @@
+{
+  "name": "merkle-zk-proof",
+  "version": "1.0.0",
+  "description": "Zero-knowledge Merkle tree membership proofs for bintree",
+  "scripts": {
+    "proof": "bash scripts/proof.sh",
+    "verify": "node scripts/verify_zkverify.js build/proof.json build/public.json"
+  },
+  "keywords": [
+    "zk-proof",
+    "merkle-tree",
+    "circom",
+    "snarkjs"
+  ],
+  "author": "",
+  "license": "MIT",
+  "devDependencies": {
+    "axios": "^1.6.0",
+    "circom2": "^0.2.22",
+    "circomlib": "^2.0.5",
+    "circomlibjs": "^0.1.7",
+    "dotenv": "^16.0.0",
+    "snarkjs": "^0.7.5"
+  }
+}
