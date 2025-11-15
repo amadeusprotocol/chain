@@ -48,7 +48,7 @@ use vecpak::{encode, decode, Term};
 
 encode(Term::Binary(b"peter piper picked a pack of pickled peppers"))?;
 encode(Term::VarInt(67 as i128))?;
-let bin = encode(Term::Map(
+let bin = encode(Term::PropList( // Map and PropList == same Tag but RUST implementation needs fixes to play nice with types
     [
         (Term::Binary(b"fruit"), Term::Binary(b"apple")),
         (Term::Binary(b"color"), Term::Binary(b"red")),

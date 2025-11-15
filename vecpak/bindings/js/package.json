@@ -1,0 +1,16 @@
+{
+  "name": "@amadeusprotocol/vecpak-js",
+  "version": "0.1.0",
+  "description": "JS bindings for vecpak",
+  "type": "module",
+  "main": "./index.js",
+  "exports": {
+    ".": {
+      "import": "./index.js"
+    }
+  },
+  "files": [
+    "*.js"
+  ],
+  "license": "GPL-3.0-only"
+}
