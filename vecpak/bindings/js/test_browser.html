@@ -1,0 +1,51 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>vecpak browser test</title></head>
+<body>
+<pre id="out">running…</pre>
+<script type="module">
+// Browser test harness — no Node APIs (Buffer etc.), only DOM/Web globals.
+// Proves the binding (BigInt-heavy) runs in a real browser.
+import { encode, decode } from "./index.js";
+
+const hex = (u) => Array.from(u, (b) => b.toString(16).padStart(2, "0")).join("");
+const fromHex = (h) => new Uint8Array(h.match(/../g).map((x) => parseInt(x, 16)));
+const utf8 = (u) => new TextDecoder().decode(u);
+
+let pass = 0, fail = 0;
+const log = [];
+const eq = (n, g, w) => { if (g === w) pass++; else { fail++; log.push(`FAIL ${n}: got ${g} want ${w}`); } };
+const throws = (n, fn, msg) => {
+  try { fn(); fail++; log.push(`FAIL ${n}: expected throw`); }
+  catch (e) { if (msg && !e.message.includes(msg)) { fail++; log.push(`FAIL ${n}: "${e.message}"`); } else pass++; }
+};
+
+// The crux: bare global BigInt must resolve in the browser.
+eq("typeof BigInt === function", typeof BigInt, "function");
+eq("BigInt === window.BigInt", BigInt === window.BigInt, true);
+eq("BigInt === globalThis.BigInt", BigInt === globalThis.BigInt, true);
+
+// BigInt-heavy encode/decode (the paths that use BigInt internally)
+eq("enc i128min", hex(encode(-(1n << 127n))), "039080000000000000000000000000000000");
+eq("dec i128min", decode(fromHex("039080000000000000000000000000000000")), -(1n << 127n));
+eq("enc person", hex(encode({ name: "Alice", age: 30, active: true })),
+  "07010305010361676503011e0501046e616d65050105416c69636505010661637469766501");
+eq("rt big > 2^53", decode(encode(9007199254740993n)), 9007199254740993n);
+eq("rt 512-bit (arbitrary precision)", decode(encode((1n << 511n) + 0xdeadbeefn)), (1n << 511n) + 0xdeadbeefn);
+eq("rt str", utf8(decode(encode("héllo"))), "héllo");
+
+// security/canonical checks still fire in the browser
+throws("depth limit", () => {
+  let d = new Uint8Array([0]);
+  for (let i = 0; i < 100000; i++) { const w = new Uint8Array(d.length + 3); w[0] = 6; w[1] = 1; w[2] = 1; w.set(d, 3); d = w; }
+  decode(d);
+}, "depth_limit_exceeded");
+throws("map order", () => decode(fromHex("0701020501016203010105010161030102")), "map_not_canonical");
+throws("varint leading zero", () => decode(fromHex("03020005")), "varint_leading_zero");
+
+const summary = `BROWSER RESULT: ${pass} passed, ${fail} failed\n` + log.join("\n");
+document.getElementById("out").textContent = summary;
+document.title = fail === 0 ? "ALL_PASS" : "HAS_FAIL";
+</script>
+</body>
+</html>
