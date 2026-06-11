@@ -277,15 +277,10 @@ pub fn decode_term<'a>(
                 let v = decode_term(env, buf, i, limits, depth)?;
 
                 if let Ok(bin) = Binary::from_term(k) {
-                    let bytes = bin.as_slice();
-                    let atom = if matches!(bytes, b"nil" | b"true" | b"false") {
-                        None
+                    if let Ok(Some(atom)) = Atom::try_from_bytes(env, bin.as_slice()) {
+                        map = map.map_put(atom, v)?;
                     } else {
-                        Atom::try_from_bytes(env, bytes).ok().flatten()
-                    };
-                    match atom {
-                        Some(a) => map = map.map_put(a, v)?,
-                        None => map = map.map_put(k, v)?,
+                        map = map.map_put(k, v)?;
                     }
                 } else {
                     map = map.map_put(k, v)?;

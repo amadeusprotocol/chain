@@ -45,7 +45,9 @@ Map keys can be anything (making Tuple usage easy) and are ordered by encoded by
 ### Limitations
 
 - Floats not supported
-- VarInt numbers >i128 are not supported
+- Integers are arbitrary-precision; the Term decoder returns `VarInt(i128)` when
+  a value fits and `BigInt` otherwise. Serde deserialization into a fixed-width
+  integer (e.g. `i128`) errors deterministically if the value is larger.
 
 ### Usage
 

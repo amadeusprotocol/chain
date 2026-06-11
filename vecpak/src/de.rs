@@ -1,15 +1,24 @@
 use crate::{
     decode_varint,
     error::{Error, Result},
+    limits::Limits,
 };
 use serde::de::{
     self, Deserialize, DeserializeSeed, IntoDeserializer, MapAccess, SeqAccess, Visitor,
 };
 
+fn canonical_variant_name(text: &str) -> Result<String> {
+    let pascal = to_pascal_case(text);
+    if crate::ser::to_snake_case(&pascal) != text {
+        return Err(Error::NonCanonical("non_canonical_variant_name"));
+    }
+    Ok(pascal)
+}
+
 /// The vecpak format uses snake_case for enum variants on the wire
 /// Serde's derive macros expect PascalCase for Rust enum variants
 /// This function converts snake_case to PascalCase to bridge the two
-fn to_pascal_case(s: &str) -> String {
+pub(crate) fn to_pascal_case(s: &str) -> String {
     let mut result = String::new();
     let mut cap_next = true;
     for c in s.chars() {
@@ -28,10 +37,19 @@ fn to_pascal_case(s: &str) -> String {
 pub struct Deserializer<'de> {
     input: &'de [u8],
     pos: usize,
+    limits: Limits,
+    depth: usize,
 }
 
 pub fn from_slice<'a, T: Deserialize<'a>>(input: &'a [u8]) -> Result<T> {
-    let mut deserializer = Deserializer { input, pos: 0 };
+    from_slice_with_limits(input, &Limits::default())
+}
+
+pub fn from_slice_with_limits<'a, T: Deserialize<'a>>(
+    input: &'a [u8],
+    limits: &Limits,
+) -> Result<T> {
+    let mut deserializer = Deserializer::with_limits(input, *limits);
     let value = T::deserialize(&mut deserializer)?;
     if deserializer.pos != input.len() {
         return Err(Error::TrailingBytes);
@@ -40,6 +58,35 @@ pub fn from_slice<'a, T: Deserialize<'a>>(input: &'a [u8]) -> Result<T> {
 }
 
 impl<'de> Deserializer<'de> {
+    fn with_limits(input: &'de [u8], limits: Limits) -> Self {
+        Deserializer {
+            input,
+            pos: 0,
+            limits,
+            depth: 0,
+        }
+    }
+
+    fn enter(&mut self) -> Result<()> {
+        self.depth += 1;
+        if self.depth > self.limits.max_depth {
+            return Err(Error::LimitExceeded("depth_limit_exceeded"));
+        }
+        Ok(())
+    }
+
+    fn leave(&mut self) {
+        self.depth -= 1;
+    }
+
+    fn read_container_len(&mut self) -> Result<usize> {
+        let len = self.read_length()?;
+        if len > self.limits.max_container_len {
+            return Err(Error::LimitExceeded("container_too_large"));
+        }
+        Ok(len)
+    }
+
     fn read_byte(&mut self) -> Result<u8> {
         if self.pos >= self.input.len() {
             return Err(Error::Eof);
@@ -78,7 +125,8 @@ impl<'de> Deserializer<'de> {
         match self.read_byte()? {
             0 | 1 | 2 => Ok(()),
             3 => {
-                self.read_varint()?;
+                crate::decode_varint_raw(self.input, &mut self.pos)
+                    .map_err(|e| Error::Message(e.into()))?;
                 Ok(())
             }
             5 => {
@@ -87,18 +135,26 @@ impl<'de> Deserializer<'de> {
                 Ok(())
             }
             6 => {
-                let len = self.read_length()?;
+                let len = self.read_container_len()?;
+                self.enter()?;
                 for _ in 0..len {
                     self.skip_value()?;
                 }
+                self.leave();
                 Ok(())
             }
             7 => {
-                let len = self.read_length()?;
+                let len = self.read_container_len()?;
+                self.enter()?;
+                let mut prev_key: Option<(usize, usize)> = None;
                 for _ in 0..len {
+                    let ks = self.pos;
                     self.skip_value()?;
+                    let ke = self.pos;
+                    check_key_order(self.input, &mut prev_key, ks, ke)?;
                     self.skip_value()?;
                 }
+                self.leave();
                 Ok(())
             }
             _ => Err(Error::InvalidTag),
@@ -122,18 +178,35 @@ impl<'de, 'a> de::Deserializer<'de> for &'a mut Deserializer<'de> {
                 visitor.visit_borrowed_bytes(bytes)
             }
             6 => {
-                let len = self.read_length()?;
-                visitor.visit_seq(SequenceDeserializer {
-                    de: self,
+                let len = self.read_container_len()?;
+                self.enter()?;
+                let mut seq = SequenceDeserializer {
+                    de: &mut *self,
                     remaining: len,
-                })
+                };
+                let r = visitor.visit_seq(&mut seq)?;
+                let leftover = seq.remaining;
+                self.leave();
+                if leftover != 0 {
+                    return Err(Error::NonCanonical("seq_surplus_elements"));
+                }
+                Ok(r)
             }
             7 => {
-                let len = self.read_length()?;
-                visitor.visit_map(MapDeserializer {
-                    de: self,
+                let len = self.read_container_len()?;
+                self.enter()?;
+                let mut map = MapDeserializer {
+                    de: &mut *self,
                     remaining: len,
-                })
+                    prev_key: None,
+                };
+                let r = visitor.visit_map(&mut map)?;
+                let leftover = map.remaining;
+                self.leave();
+                if leftover != 0 {
+                    return Err(Error::NonCanonical("map_surplus_entries"));
+                }
+                Ok(r)
             }
             _ => Err(Error::InvalidTag),
         }
@@ -151,28 +224,32 @@ impl<'de, 'a> de::Deserializer<'de> for &'a mut Deserializer<'de> {
         if self.read_byte()? != 3 {
             return Err(Error::InvalidTag);
         }
-        visitor.visit_i8(self.read_varint()? as i8)
+        let v = i8::try_from(self.read_varint()?).map_err(|_| Error::IntegerOutOfRange)?;
+        visitor.visit_i8(v)
     }
 
     fn deserialize_i16<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value> {
         if self.read_byte()? != 3 {
             return Err(Error::InvalidTag);
         }
-        visitor.visit_i16(self.read_varint()? as i16)
+        let v = i16::try_from(self.read_varint()?).map_err(|_| Error::IntegerOutOfRange)?;
+        visitor.visit_i16(v)
     }
 
     fn deserialize_i32<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value> {
         if self.read_byte()? != 3 {
             return Err(Error::InvalidTag);
         }
-        visitor.visit_i32(self.read_varint()? as i32)
+        let v = i32::try_from(self.read_varint()?).map_err(|_| Error::IntegerOutOfRange)?;
+        visitor.visit_i32(v)
     }
 
     fn deserialize_i64<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value> {
         if self.read_byte()? != 3 {
             return Err(Error::InvalidTag);
         }
-        visitor.visit_i64(self.read_varint()? as i64)
+        let v = i64::try_from(self.read_varint()?).map_err(|_| Error::IntegerOutOfRange)?;
+        visitor.visit_i64(v)
     }
 
     fn deserialize_i128<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value> {
@@ -186,35 +263,40 @@ impl<'de, 'a> de::Deserializer<'de> for &'a mut Deserializer<'de> {
         if self.read_byte()? != 3 {
             return Err(Error::InvalidTag);
         }
-        visitor.visit_u8(self.read_varint()? as u8)
+        let v = u8::try_from(self.read_varint()?).map_err(|_| Error::IntegerOutOfRange)?;
+        visitor.visit_u8(v)
     }
 
     fn deserialize_u16<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value> {
         if self.read_byte()? != 3 {
             return Err(Error::InvalidTag);
         }
-        visitor.visit_u16(self.read_varint()? as u16)
+        let v = u16::try_from(self.read_varint()?).map_err(|_| Error::IntegerOutOfRange)?;
+        visitor.visit_u16(v)
     }
 
     fn deserialize_u32<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value> {
         if self.read_byte()? != 3 {
             return Err(Error::InvalidTag);
         }
-        visitor.visit_u32(self.read_varint()? as u32)
+        let v = u32::try_from(self.read_varint()?).map_err(|_| Error::IntegerOutOfRange)?;
+        visitor.visit_u32(v)
     }
 
     fn deserialize_u64<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value> {
         if self.read_byte()? != 3 {
             return Err(Error::InvalidTag);
         }
-        visitor.visit_u64(self.read_varint()? as u64)
+        let v = u64::try_from(self.read_varint()?).map_err(|_| Error::IntegerOutOfRange)?;
+        visitor.visit_u64(v)
     }
 
     fn deserialize_u128<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value> {
         if self.read_byte()? != 3 {
             return Err(Error::InvalidTag);
         }
-        visitor.visit_u128(self.read_varint()? as u128)
+        let v = u128::try_from(self.read_varint()?).map_err(|_| Error::IntegerOutOfRange)?;
+        visitor.visit_u128(v)
     }
 
     fn deserialize_f32<V: Visitor<'de>>(self, _visitor: V) -> Result<V::Value> {
@@ -282,9 +364,20 @@ impl<'de, 'a> de::Deserializer<'de> for &'a mut Deserializer<'de> {
 
     fn deserialize_newtype_struct<V: Visitor<'de>>(
         self,
-        _name: &'static str,
+        name: &'static str,
         visitor: V,
     ) -> Result<V::Value> {
+        if name == crate::bigint::BIGVARINT_TOKEN {
+            if self.read_byte()? != 3 {
+                return Err(Error::InvalidTag);
+            }
+            let (negative, mag) = crate::decode_varint_raw(self.input, &mut self.pos)
+                .map_err(|e| Error::Message(e.into()))?;
+            let mut packed = Vec::with_capacity(mag.len() + 1);
+            packed.push(negative as u8);
+            packed.extend_from_slice(mag);
+            return visitor.visit_byte_buf(packed);
+        }
         visitor.visit_newtype_struct(self)
     }
 
@@ -292,11 +385,19 @@ impl<'de, 'a> de::Deserializer<'de> for &'a mut Deserializer<'de> {
         if self.read_byte()? != 6 {
             return Err(Error::InvalidTag);
         }
-        let len = self.read_length()?;
-        visitor.visit_seq(SequenceDeserializer {
-            de: self,
+        let len = self.read_container_len()?;
+        self.enter()?;
+        let mut seq = SequenceDeserializer {
+            de: &mut *self,
             remaining: len,
-        })
+        };
+        let r = visitor.visit_seq(&mut seq)?;
+        let leftover = seq.remaining;
+        self.leave();
+        if leftover != 0 {
+            return Err(Error::NonCanonical("seq_surplus_elements"));
+        }
+        Ok(r)
     }
 
     fn deserialize_tuple<V: Visitor<'de>>(self, _len: usize, visitor: V) -> Result<V::Value> {
@@ -316,11 +417,20 @@ impl<'de, 'a> de::Deserializer<'de> for &'a mut Deserializer<'de> {
         if self.read_byte()? != 7 {
             return Err(Error::InvalidTag);
         }
-        let len = self.read_length()?;
-        visitor.visit_map(MapDeserializer {
-            de: self,
+        let len = self.read_container_len()?;
+        self.enter()?;
+        let mut map = MapDeserializer {
+            de: &mut *self,
             remaining: len,
-        })
+            prev_key: None,
+        };
+        let r = visitor.visit_map(&mut map)?;
+        let leftover = map.remaining;
+        self.leave();
+        if leftover != 0 {
+            return Err(Error::NonCanonical("map_surplus_entries"));
+        }
+        Ok(r)
     }
 
     fn deserialize_struct<V: Visitor<'de>>(
@@ -341,6 +451,9 @@ impl<'de, 'a> de::Deserializer<'de> for &'a mut Deserializer<'de> {
         visitor.visit_enum(EnumDeserializer {
             de: self,
             entries: Vec::new(),
+            tuple_value: None,
+            op_map: false,
+            bare_string: false,
         })
     }
 
@@ -370,9 +483,25 @@ impl<'de, 'a> SeqAccess<'de> for SequenceDeserializer<'a, 'de> {
     }
 }
 
+fn check_key_order(
+    input: &[u8],
+    prev: &mut Option<(usize, usize)>,
+    ks: usize,
+    ke: usize,
+) -> Result<()> {
+    if let Some((ps, pe)) = *prev {
+        if input[ks..ke] <= input[ps..pe] {
+            return Err(Error::NonCanonical("map_not_canonical"));
+        }
+    }
+    *prev = Some((ks, ke));
+    Ok(())
+}
+
 struct MapDeserializer<'a, 'de: 'a> {
     de: &'a mut Deserializer<'de>,
     remaining: usize,
+    prev_key: Option<(usize, usize)>,
 }
 
 impl<'de, 'a> MapAccess<'de> for MapDeserializer<'a, 'de> {
@@ -383,7 +512,11 @@ impl<'de, 'a> MapAccess<'de> for MapDeserializer<'a, 'de> {
             return Ok(None);
         }
         self.remaining -= 1;
-        seed.deserialize(&mut *self.de).map(Some)
+        let ks = self.de.pos;
+        let key = seed.deserialize(&mut *self.de)?;
+        let ke = self.de.pos;
+        check_key_order(self.de.input, &mut self.prev_key, ks, ke)?;
+        Ok(Some(key))
     }
 
     fn next_value_seed<V: DeserializeSeed<'de>>(&mut self, seed: V) -> Result<V::Value> {
@@ -394,6 +527,9 @@ impl<'de, 'a> MapAccess<'de> for MapDeserializer<'a, 'de> {
 struct EnumDeserializer<'a, 'de: 'a> {
     de: &'a mut Deserializer<'de>,
     entries: Vec<(usize, usize, usize, usize)>,
+    tuple_value: Option<(usize, usize)>,
+    op_map: bool,
+    bare_string: bool,
 }
 
 impl<'de, 'a> de::EnumAccess<'de> for EnumDeserializer<'a, 'de> {
@@ -416,16 +552,19 @@ impl<'de, 'a> de::EnumAccess<'de> for EnumDeserializer<'a, 'de> {
     ) -> Result<(V::Value, Self::Variant)> {
         let tag = self.de.read_byte()?;
         if tag == 5 {
-            // Case 1: Unit variant (e.g., MyEnum::Variant) is encoded as a simple string.
+            self.bare_string = true;
             let len = self.de.read_length()?;
             let bytes = self.de.read_bytes(len)?;
             let text = std::str::from_utf8(bytes).map_err(|_| Error::InvalidUtf8)?;
-            let pascal = to_pascal_case(text);
+            let pascal = canonical_variant_name(text)?;
             let val = seed.deserialize(pascal.into_deserializer())?;
             Ok((val, self))
         } else if tag == 7 {
-            let count = self.de.read_length()?;
+            let count = self.de.read_container_len()?;
+            self.de.enter()?;
             let mut variant: Option<String> = None;
+            let mut last_key: Option<String> = None;
+            let mut prev_key: Option<(usize, usize)> = None;
             for _ in 0..count {
                 let ks = self.de.pos;
                 if self.de.read_byte()? != 5 {
@@ -434,21 +573,42 @@ impl<'de, 'a> de::EnumAccess<'de> for EnumDeserializer<'a, 'de> {
                 let klen = self.de.read_length()?;
                 let key = self.de.read_bytes(klen)?;
                 let ke = self.de.pos;
+                check_key_order(self.de.input, &mut prev_key, ks, ke)?;
                 let vs = self.de.pos;
                 if key == b"op" {
+                    if variant.is_some() {
+                        return Err(Error::Message("duplicate op field".into()));
+                    }
+                    self.op_map = true;
                     if self.de.read_byte()? != 5 {
                         return Err(Error::InvalidTag);
                     }
                     let vlen = self.de.read_length()?;
                     let text = std::str::from_utf8(self.de.read_bytes(vlen)?)
                         .map_err(|_| Error::InvalidUtf8)?;
-                    variant = Some(to_pascal_case(text));
+                    variant = Some(canonical_variant_name(text)?);
                 } else {
+                    last_key = Some(
+                        std::str::from_utf8(key)
+                            .map_err(|_| Error::InvalidUtf8)?
+                            .to_string(),
+                    );
                     self.de.skip_value()?;
                     self.entries.push((ks, ke, vs, self.de.pos));
                 }
             }
-            let var = variant.ok_or_else(|| Error::Message("missing op field".into()))?;
+            self.de.leave();
+            let var = match variant {
+                Some(v) => v,
+                None if self.entries.len() == 1 => {
+                    let (_, _, vs, ve) = self.entries[0];
+                    self.tuple_value = Some((vs, ve));
+                    self.entries.clear();
+                    let raw = last_key.ok_or_else(|| Error::Message("missing op field".into()))?;
+                    canonical_variant_name(&raw)?
+                }
+                None => return Err(Error::Message("missing op field".into())),
+            };
             let val = seed.deserialize(var.into_deserializer())?;
             Ok((val, self))
         } else {
@@ -461,27 +621,47 @@ impl<'de, 'a> de::VariantAccess<'de> for EnumDeserializer<'a, 'de> {
     type Error = Error;
 
     fn unit_variant(self) -> Result<()> {
+        if self.op_map || !self.entries.is_empty() || self.tuple_value.is_some() {
+            return Err(Error::NonCanonical("unit_variant_extra_entries"));
+        }
         Ok(())
     }
 
     fn newtype_variant_seed<T: DeserializeSeed<'de>>(self, seed: T) -> Result<T::Value> {
-        // If we have buffered entries from a proplist, use them as the struct fields
-        // This handles newtype variants like Protocol::NewPhoneWhoDis(NewPhoneWhoDis {})
-        // where the wire format is [{op, "new_phone_who_dis"}, ...struct_fields...]
-        if !self.entries.is_empty() || self.de.pos >= self.de.input.len() {
-            // Use BufferedMapDeserializer to reconstruct the inner struct from buffered entries
+        if self.bare_string {
+            return Err(Error::NonCanonical("non_unit_variant_bare_string"));
+        }
+        if let Some((vs, ve)) = self.tuple_value {
+            let mut de = Deserializer::with_limits(&self.de.input[vs..ve], self.de.limits);
+            let v = seed.deserialize(&mut de)?;
+            if de.pos != ve - vs {
+                return Err(Error::TrailingBytes);
+            }
+            Ok(v)
+        } else {
             let mut buf_de = BufferedMapDeserializer {
                 input: self.de.input,
                 entries: self.entries,
+                limits: self.de.limits,
             };
             seed.deserialize(&mut buf_de)
-        } else {
-            seed.deserialize(self.de)
         }
     }
 
     fn tuple_variant<V: Visitor<'de>>(self, _len: usize, visitor: V) -> Result<V::Value> {
-        de::Deserializer::deserialize_seq(self.de, visitor)
+        if self.bare_string {
+            return Err(Error::NonCanonical("non_unit_variant_bare_string"));
+        }
+        if let Some((vs, ve)) = self.tuple_value {
+            let mut de = Deserializer::with_limits(&self.de.input[vs..ve], self.de.limits);
+            let v = de::Deserializer::deserialize_seq(&mut de, visitor)?;
+            if de.pos != ve - vs {
+                return Err(Error::TrailingBytes);
+            }
+            Ok(v)
+        } else {
+            Err(Error::NonCanonical("tuple_variant_requires_list_form"))
+        }
     }
 
     fn struct_variant<V: Visitor<'de>>(
@@ -489,10 +669,17 @@ impl<'de, 'a> de::VariantAccess<'de> for EnumDeserializer<'a, 'de> {
         _fields: &'static [&'static str],
         visitor: V,
     ) -> Result<V::Value> {
+        if self.bare_string {
+            return Err(Error::NonCanonical("non_unit_variant_bare_string"));
+        }
+        if self.tuple_value.is_some() {
+            return Err(Error::NonCanonical("struct_variant_nested_form"));
+        }
         visitor.visit_map(BufferedMapAccess {
             input: self.de.input,
             entries: self.entries,
             idx: 0,
+            limits: self.de.limits,
         })
     }
 }
@@ -501,6 +688,7 @@ struct BufferedMapAccess<'de> {
     input: &'de [u8],
     entries: Vec<(usize, usize, usize, usize)>,
     idx: usize,
+    limits: Limits,
 }
 
 impl<'de> MapAccess<'de> for BufferedMapAccess<'de> {
@@ -511,21 +699,23 @@ impl<'de> MapAccess<'de> for BufferedMapAccess<'de> {
             return Ok(None);
         }
         let (ks, ke, _, _) = self.entries[self.idx];
-        let mut de = Deserializer {
-            input: &self.input[ks..ke],
-            pos: 0,
-        };
-        seed.deserialize(&mut de).map(Some)
+        let mut de = Deserializer::with_limits(&self.input[ks..ke], self.limits);
+        let k = seed.deserialize(&mut de)?;
+        if de.pos != ke - ks {
+            return Err(Error::TrailingBytes);
+        }
+        Ok(Some(k))
     }
 
     fn next_value_seed<V: DeserializeSeed<'de>>(&mut self, seed: V) -> Result<V::Value> {
         let (_, _, vs, ve) = self.entries[self.idx];
         self.idx += 1;
-        let mut de = Deserializer {
-            input: &self.input[vs..ve],
-            pos: 0,
-        };
-        seed.deserialize(&mut de)
+        let mut de = Deserializer::with_limits(&self.input[vs..ve], self.limits);
+        let v = seed.deserialize(&mut de)?;
+        if de.pos != ve - vs {
+            return Err(Error::TrailingBytes);
+        }
+        Ok(v)
     }
 }
 
@@ -534,13 +724,13 @@ impl<'de> MapAccess<'de> for BufferedMapAccess<'de> {
 struct BufferedMapDeserializer<'de> {
     input: &'de [u8],
     entries: Vec<(usize, usize, usize, usize)>,
+    limits: Limits,
 }
 
 impl<'de, 'a> de::Deserializer<'de> for &'a mut BufferedMapDeserializer<'de> {
     type Error = Error;
 
     fn deserialize_any<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value> {
-        // Treat as a map/struct
         self.deserialize_map(visitor)
     }
 
@@ -549,6 +739,7 @@ impl<'de, 'a> de::Deserializer<'de> for &'a mut BufferedMapDeserializer<'de> {
             input: self.input,
             entries: std::mem::take(&mut self.entries),
             idx: 0,
+            limits: self.limits,
         })
     }
 

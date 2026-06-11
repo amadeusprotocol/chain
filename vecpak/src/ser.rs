@@ -4,56 +4,7 @@ use crate::{
 };
 use serde::{ser, Serialize};
 
-/// Skip over a value in the byte buffer and return the new position
-fn skip_value_bytes(buf: &[u8], mut pos: usize) -> Result<usize> {
-    if pos >= buf.len() {
-        return Err(Error::Message("eof in skip_value_bytes".into()));
-    }
-    let tag = buf[pos];
-    pos += 1;
-    match tag {
-        0 | 1 | 2 => Ok(pos), // nil, true, false
-        3 => {
-            // varint
-            let (_, bytes_read) =
-                decode_varint_with_len(&buf[pos..]).map_err(|e| Error::Message(e.into()))?;
-            Ok(pos + bytes_read)
-        }
-        5 => {
-            // binary
-            let (len, bytes_read) =
-                decode_varint_with_len(&buf[pos..]).map_err(|e| Error::Message(e.into()))?;
-            Ok(pos + bytes_read + len as usize)
-        }
-        6 => {
-            // list
-            let (count, bytes_read) =
-                decode_varint_with_len(&buf[pos..]).map_err(|e| Error::Message(e.into()))?;
-            pos += bytes_read;
-            for _ in 0..count {
-                pos = skip_value_bytes(buf, pos)?;
-            }
-            Ok(pos)
-        }
-        7 => {
-            // proplist
-            let (count, bytes_read) =
-                decode_varint_with_len(&buf[pos..]).map_err(|e| Error::Message(e.into()))?;
-            pos += bytes_read;
-            for _ in 0..count {
-                pos = skip_value_bytes(buf, pos)?; // key
-                pos = skip_value_bytes(buf, pos)?; // value
-            }
-            Ok(pos)
-        }
-        _ => Err(Error::Message(format!(
-            "unknown tag {} in skip_value_bytes",
-            tag
-        ))),
-    }
-}
-
-fn to_snake_case(s: &str) -> String {
+pub(crate) fn to_snake_case(s: &str) -> String {
     let mut result = String::new();
     for (i, c) in s.chars().enumerate() {
         if c.is_uppercase() {
@@ -68,23 +19,83 @@ fn to_snake_case(s: &str) -> String {
     result
 }
 
+fn variant_wire_name(variant: &'static str) -> Result<String> {
+    let snake = to_snake_case(variant);
+    if crate::de::to_pascal_case(&snake) != variant {
+        return Err(Error::Message(format!(
+            "enum variant name '{variant}' is not round-trip-safe through the \
+             snake_case wire convention (use idiomatic CamelCase or #[serde(rename)])"
+        )));
+    }
+    Ok(snake)
+}
+
+fn map_variant_wire_name(variant: &'static str) -> Result<String> {
+    let snake = variant_wire_name(variant)?;
+    if snake == "op" {
+        return Err(Error::Message(
+            "enum variant name 'op' conflicts with the variant tag".into(),
+        ));
+    }
+    Ok(snake)
+}
+
 pub struct Serializer {
     output: Vec<u8>,
+    depth: usize,
+    limits: crate::Limits,
 }
 
 pub fn to_vec<T: Serialize>(value: &T) -> Result<Vec<u8>> {
-    let mut serializer = Serializer { output: Vec::new() };
+    to_vec_with_limits(value, &crate::Limits::default())
+}
+
+pub fn to_vec_with_limits<T: Serialize>(value: &T, limits: &crate::Limits) -> Result<Vec<u8>> {
+    let mut serializer = Serializer {
+        output: Vec::new(),
+        depth: 0,
+        limits: *limits,
+    };
     value.serialize(&mut serializer)?;
     Ok(serializer.output)
+}
+
+impl Serializer {
+    fn child(&self) -> Serializer {
+        Serializer {
+            output: Vec::new(),
+            depth: self.depth,
+            limits: self.limits,
+        }
+    }
+    #[inline]
+    fn enter(&mut self) -> Result<()> {
+        self.depth += 1;
+        if self.depth > self.limits.max_depth {
+            return Err(Error::LimitExceeded("depth_limit_exceeded"));
+        }
+        Ok(())
+    }
+    #[inline]
+    fn leave(&mut self) {
+        self.depth -= 1;
+    }
+    #[inline]
+    fn check_len(&self, len: usize) -> Result<()> {
+        if len > self.limits.max_container_len {
+            return Err(Error::LimitExceeded("container_too_large"));
+        }
+        Ok(())
+    }
 }
 
 impl<'a> ser::Serializer for &'a mut Serializer {
     type Ok = ();
     type Error = Error;
-    type SerializeSeq = Self;
-    type SerializeTuple = Self;
-    type SerializeTupleStruct = Self;
-    type SerializeTupleVariant = Self;
+    type SerializeSeq = SeqSerializer<'a>;
+    type SerializeTuple = SeqSerializer<'a>;
+    type SerializeTupleStruct = SeqSerializer<'a>;
+    type SerializeTupleVariant = TupleVariantSerializer<'a>;
     type SerializeMap = MapSerializer<'a>;
     type SerializeStruct = MapSerializer<'a>;
     type SerializeStructVariant = StructVariantSerializer<'a>;
@@ -178,14 +189,25 @@ impl<'a> ser::Serializer for &'a mut Serializer {
         _idx: u32,
         variant: &'static str,
     ) -> Result<()> {
-        self.serialize_str(&to_snake_case(variant))
+        let snake = variant_wire_name(variant)?;
+        self.serialize_str(&snake)
     }
 
     fn serialize_newtype_struct<T: ?Sized + Serialize>(
         self,
-        _name: &'static str,
+        name: &'static str,
         value: &T,
     ) -> Result<()> {
+        if name == crate::bigint::BIGVARINT_TOKEN {
+            let mut scratch = self.child();
+            value.serialize(&mut scratch)?;
+            let packed = binary_payload(&scratch.output)?;
+            let negative = packed.first() == Some(&1);
+            self.output.push(3);
+            crate::encode_varint_bytes(&mut self.output, negative, &packed[1..])
+                .map_err(|e| Error::Message(e.into()))?;
+            return Ok(());
+        }
         value.serialize(self)
     }
 
@@ -196,81 +218,27 @@ impl<'a> ser::Serializer for &'a mut Serializer {
         variant: &'static str,
         value: &T,
     ) -> Result<()> {
-        // Serialize inner value to a buffer first
-        let mut inner_serializer = Serializer { output: Vec::new() };
+        let snake = map_variant_wire_name(variant)?;
+        self.enter()?;
+        let mut inner_serializer = self.child();
         value.serialize(&mut inner_serializer)?;
         let inner_bytes = inner_serializer.output;
 
-        // Build the "op" key-value pair
-        let snake = to_snake_case(variant);
-        let mut op_key = vec![5];
-        encode_varint(&mut op_key, 2);
-        op_key.extend_from_slice(b"op");
-        let mut op_value = vec![5];
-        encode_varint(&mut op_value, snake.len() as i128);
-        op_value.extend_from_slice(snake.as_bytes());
-
-        // If inner value is a proplist (tag 7), merge fields with "op"
-        if inner_bytes.first() == Some(&7) {
-            // Parse the inner proplist to get entry count
-            let mut pos = 1;
-            let (inner_count, bytes_read) = decode_varint_with_len(&inner_bytes[pos..])
-                .map_err(|e| Error::Message(e.into()))?;
-            pos += bytes_read;
-
-            // Write merged proplist: op + inner fields
-            self.output.push(7);
-            encode_varint(&mut self.output, inner_count + 1);
-
-            // Collect all entries for sorting
-            let mut entries: Vec<(Vec<u8>, Vec<u8>)> = vec![(op_key, op_value)];
-
-            // Parse and collect inner entries
-            let mut inner_pos = pos;
-            for _ in 0..inner_count {
-                let key_start = inner_pos;
-                // Skip key
-                if inner_bytes.get(inner_pos) != Some(&5) {
-                    return Err(Error::Message("expected binary key".into()));
-                }
-                inner_pos += 1;
-                let (key_len, bytes_read) = decode_varint_with_len(&inner_bytes[inner_pos..])
-                    .map_err(|e| Error::Message(e.into()))?;
-                inner_pos += bytes_read + key_len as usize;
-                let key_end = inner_pos;
-
-                let value_start = inner_pos;
-                // Skip value
-                inner_pos = skip_value_bytes(&inner_bytes, inner_pos)?;
-                let value_end = inner_pos;
-
-                entries.push((
-                    inner_bytes[key_start..key_end].to_vec(),
-                    inner_bytes[value_start..value_end].to_vec(),
-                ));
-            }
-
-            // Sort entries by key and write
-            entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-            for (key_bytes, value_bytes) in entries {
-                self.output.extend_from_slice(&key_bytes);
-                self.output.extend_from_slice(&value_bytes);
-            }
-        } else {
-            // Inner value is not a proplist - just emit op field only
-            // (for unit-like structs that serialize to something other than proplist)
-            self.output.push(7);
-            encode_varint(&mut self.output, 1);
-            self.output.extend_from_slice(&op_key);
-            self.output.extend_from_slice(&op_value);
-        }
+        self.output.push(7);
+        encode_varint(&mut self.output, 1);
+        self.serialize_str(&snake)?;
+        self.output.extend_from_slice(&inner_bytes);
+        self.leave();
         Ok(())
     }
 
-    fn serialize_seq(self, len: Option<usize>) -> Result<Self::SerializeSeq> {
-        self.output.push(6);
-        encode_varint(&mut self.output, len.unwrap_or(0) as i128);
-        Ok(self)
+    fn serialize_seq(self, _len: Option<usize>) -> Result<Self::SerializeSeq> {
+        self.enter()?;
+        Ok(SeqSerializer {
+            ser: self,
+            buf: Vec::new(),
+            count: 0,
+        })
     }
 
     fn serialize_tuple(self, len: usize) -> Result<Self::SerializeTuple> {
@@ -291,18 +259,25 @@ impl<'a> ser::Serializer for &'a mut Serializer {
         variant: &'static str,
         len: usize,
     ) -> Result<Self::SerializeTupleVariant> {
-        self.output.push(7);
-        encode_varint(&mut self.output, 1);
-        self.serialize_str(&to_snake_case(variant))?;
-        self.serialize_seq(Some(len))?;
-        Ok(self)
+        let snake = map_variant_wire_name(variant)?;
+        self.check_len(len)?;
+        self.enter()?;
+        self.enter()?;
+        Ok(TupleVariantSerializer {
+            ser: self,
+            snake,
+            buf: Vec::new(),
+            count: 0,
+        })
     }
 
     fn serialize_map(self, _len: Option<usize>) -> Result<Self::SerializeMap> {
+        self.enter()?;
         Ok(MapSerializer::new(self))
     }
 
     fn serialize_struct(self, _name: &'static str, _len: usize) -> Result<Self::SerializeStruct> {
+        self.enter()?;
         Ok(MapSerializer::new(self))
     }
 
@@ -313,11 +288,12 @@ impl<'a> ser::Serializer for &'a mut Serializer {
         variant: &'static str,
         _len: usize,
     ) -> Result<Self::SerializeStructVariant> {
-        let snake = to_snake_case(variant);
+        let snake = map_variant_wire_name(variant)?;
         let mut variant_bytes = Vec::new();
         variant_bytes.push(5);
         encode_varint(&mut variant_bytes, snake.len() as i128);
         variant_bytes.extend_from_slice(snake.as_bytes());
+        self.enter()?;
         Ok(StructVariantSerializer {
             ser: self,
             variant_bytes,
@@ -326,46 +302,91 @@ impl<'a> ser::Serializer for &'a mut Serializer {
     }
 }
 
-impl<'a> ser::SerializeSeq for &'a mut Serializer {
+pub struct SeqSerializer<'a> {
+    ser: &'a mut Serializer,
+    buf: Vec<u8>,
+    count: usize,
+}
+
+impl SeqSerializer<'_> {
+    fn push<T: ?Sized + Serialize>(&mut self, value: &T) -> Result<()> {
+        let mut child = self.ser.child();
+        value.serialize(&mut child)?;
+        self.buf.extend_from_slice(&child.output);
+        self.count += 1;
+        Ok(())
+    }
+    fn finish(self) -> Result<()> {
+        self.ser.check_len(self.count)?;
+        self.ser.output.push(6);
+        encode_varint(&mut self.ser.output, self.count as i128);
+        self.ser.output.extend_from_slice(&self.buf);
+        self.ser.leave();
+        Ok(())
+    }
+}
+
+impl ser::SerializeSeq for SeqSerializer<'_> {
     type Ok = ();
     type Error = Error;
     fn serialize_element<T: ?Sized + Serialize>(&mut self, value: &T) -> Result<()> {
-        value.serialize(&mut **self)
+        self.push(value)
     }
     fn end(self) -> Result<()> {
-        Ok(())
+        self.finish()
     }
 }
 
-impl<'a> ser::SerializeTuple for &'a mut Serializer {
+impl ser::SerializeTuple for SeqSerializer<'_> {
     type Ok = ();
     type Error = Error;
     fn serialize_element<T: ?Sized + Serialize>(&mut self, value: &T) -> Result<()> {
-        value.serialize(&mut **self)
+        self.push(value)
     }
     fn end(self) -> Result<()> {
-        Ok(())
+        self.finish()
     }
 }
 
-impl<'a> ser::SerializeTupleStruct for &'a mut Serializer {
+impl ser::SerializeTupleStruct for SeqSerializer<'_> {
     type Ok = ();
     type Error = Error;
     fn serialize_field<T: ?Sized + Serialize>(&mut self, value: &T) -> Result<()> {
-        value.serialize(&mut **self)
+        self.push(value)
     }
     fn end(self) -> Result<()> {
-        Ok(())
+        self.finish()
     }
 }
 
-impl<'a> ser::SerializeTupleVariant for &'a mut Serializer {
+pub struct TupleVariantSerializer<'a> {
+    ser: &'a mut Serializer,
+    snake: String,
+    buf: Vec<u8>,
+    count: usize,
+}
+
+impl ser::SerializeTupleVariant for TupleVariantSerializer<'_> {
     type Ok = ();
     type Error = Error;
     fn serialize_field<T: ?Sized + Serialize>(&mut self, value: &T) -> Result<()> {
-        value.serialize(&mut **self)
+        let mut child = self.ser.child();
+        value.serialize(&mut child)?;
+        self.buf.extend_from_slice(&child.output);
+        self.count += 1;
+        Ok(())
     }
     fn end(self) -> Result<()> {
+        self.ser.output.push(7);
+        encode_varint(&mut self.ser.output, 1);
+        self.ser.output.push(5);
+        encode_varint(&mut self.ser.output, self.snake.len() as i128);
+        self.ser.output.extend_from_slice(self.snake.as_bytes());
+        self.ser.output.push(6);
+        encode_varint(&mut self.ser.output, self.count as i128);
+        self.ser.output.extend_from_slice(&self.buf);
+        self.ser.leave();
+        self.ser.leave();
         Ok(())
     }
 }
@@ -390,9 +411,9 @@ impl<'a> ser::SerializeStructVariant for StructVariantSerializer<'a> {
                 "field 'op' conflicts with enum variant tag".into(),
             ));
         }
-        let mut key_serializer = Serializer { output: Vec::new() };
+        let mut key_serializer = self.ser.child();
         key.serialize(&mut key_serializer)?;
-        let mut value_serializer = Serializer { output: Vec::new() };
+        let mut value_serializer = self.ser.child();
         value.serialize(&mut value_serializer)?;
         self.entries
             .push((key_serializer.output, value_serializer.output));
@@ -406,12 +427,17 @@ impl<'a> ser::SerializeStructVariant for StructVariantSerializer<'a> {
         op_key.extend_from_slice(b"op");
         entries.push((op_key, self.variant_bytes));
         entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        if entries.windows(2).any(|w| w[0].0 == w[1].0) {
+            return Err(Error::Message("duplicate_map_key".into()));
+        }
+        self.ser.check_len(entries.len())?;
         self.ser.output.push(7);
         encode_varint(&mut self.ser.output, entries.len() as i128);
         for (key_bytes, value_bytes) in entries {
             self.ser.output.extend_from_slice(&key_bytes);
             self.ser.output.extend_from_slice(&value_bytes);
         }
+        self.ser.leave();
         Ok(())
     }
 }
@@ -432,12 +458,17 @@ impl<'a> MapSerializer<'a> {
     fn end_map(self) -> Result<()> {
         let mut entries = self.entries;
         entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        if entries.windows(2).any(|w| w[0].0 == w[1].0) {
+            return Err(Error::Message("duplicate_map_key".into()));
+        }
+        self.ser.check_len(entries.len())?;
         self.ser.output.push(7);
         encode_varint(&mut self.ser.output, entries.len() as i128);
         for (key_bytes, value_bytes) in entries {
             self.ser.output.extend_from_slice(&key_bytes);
             self.ser.output.extend_from_slice(&value_bytes);
         }
+        self.ser.leave();
         Ok(())
     }
 }
@@ -447,14 +478,14 @@ impl<'a> ser::SerializeMap for MapSerializer<'a> {
     type Error = Error;
 
     fn serialize_key<T: ?Sized + Serialize>(&mut self, key: &T) -> Result<()> {
-        let mut key_serializer = Serializer { output: Vec::new() };
+        let mut key_serializer = self.ser.child();
         key.serialize(&mut key_serializer)?;
         self.entries.push((key_serializer.output, Vec::new()));
         Ok(())
     }
 
     fn serialize_value<T: ?Sized + Serialize>(&mut self, value: &T) -> Result<()> {
-        let mut value_serializer = Serializer { output: Vec::new() };
+        let mut value_serializer = self.ser.child();
         value.serialize(&mut value_serializer)?;
         self.entries.last_mut().unwrap().1 = value_serializer.output;
         Ok(())
@@ -481,6 +512,23 @@ impl<'a> ser::SerializeStruct for MapSerializer<'a> {
     fn end(self) -> Result<()> {
         self.end_map()
     }
+}
+
+fn binary_payload(buf: &[u8]) -> Result<&[u8]> {
+    if buf.first() != Some(&5) {
+        return Err(Error::Message("bigvarint: expected packed bytes".into()));
+    }
+    let (len, read) = decode_varint_with_len(&buf[1..]).map_err(|e| Error::Message(e.into()))?;
+    let start = 1 + read;
+    let end = start + len as usize;
+    if end > buf.len() {
+        return Err(Error::Message("bigvarint: short payload".into()));
+    }
+    let payload = &buf[start..end];
+    if payload.is_empty() {
+        return Err(Error::Message("bigvarint: empty packed payload".into()));
+    }
+    Ok(payload)
 }
 
 /// Convenience function to decode a varint and return the value and its length

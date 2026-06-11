@@ -11,6 +11,9 @@ pub enum Error {
     InvalidTag,
     InvalidLength,
     InvalidUtf8,
+    LimitExceeded(&'static str),
+    IntegerOutOfRange,
+    NonCanonical(&'static str),
 }
 
 impl ser::Error for Error {
@@ -34,6 +37,9 @@ impl Display for Error {
             Error::InvalidTag => write!(f, "invalid type tag"),
             Error::InvalidLength => write!(f, "invalid length"),
             Error::InvalidUtf8 => write!(f, "invalid UTF-8"),
+            Error::LimitExceeded(which) => write!(f, "decode limit exceeded: {which}"),
+            Error::IntegerOutOfRange => write!(f, "integer out of range for target type"),
+            Error::NonCanonical(which) => write!(f, "non-canonical encoding: {which}"),
         }
     }
 }

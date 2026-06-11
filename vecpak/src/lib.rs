@@ -10,8 +10,8 @@ use limits::Budget;
 
 pub use limits::Limits;
 pub use error::Error;
-pub use ser::to_vec;
-pub use de::from_slice;
+pub use ser::{to_vec, to_vec_with_limits};
+pub use de::{from_slice, from_slice_with_limits};
 pub use bigint::BigVarInt;
 
 #[derive(Debug, Clone, PartialEq)]
