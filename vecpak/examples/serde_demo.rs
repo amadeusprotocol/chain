@@ -24,7 +24,7 @@ fn main() {
         ),
     ]);
 
-    let encoded_term = vecpak::encode(person_term.clone());
+    let encoded_term = vecpak::encode(person_term.clone()).unwrap();
     let decoded_struct: Person = from_slice(&encoded_term).unwrap();
     let encoded_struct = to_vec(&person_struct).unwrap();
     let decoded_term: vecpak::Term = vecpak::decode(&encoded_struct).unwrap();
@@ -108,7 +108,7 @@ fn main() {
         ),
     ]);
 
-    let encoded_term_complex = vecpak::encode(complex_data_term.clone());
+    let encoded_term_complex = vecpak::encode(complex_data_term.clone()).unwrap();
     let decoded_struct_complex: ComplexData = from_slice(&encoded_term_complex).unwrap();
     let encoded_struct_complex = to_vec(&complex_data_struct).unwrap();
     let decoded_term_complex: vecpak::Term = vecpak::decode(&encoded_struct_complex).unwrap();
@@ -195,7 +195,7 @@ fn main() {
         ]),
     ]);
 
-    let encoded_term_mutations = vecpak::encode(mutations_term.clone());
+    let encoded_term_mutations = vecpak::encode(mutations_term.clone()).unwrap();
     let decoded_struct_mutations: Mutations = from_slice(&encoded_term_mutations).unwrap();
     let encoded_struct_mutations = to_vec(&mutations_struct).unwrap();
     let decoded_term_mutations: vecpak::Term = vecpak::decode(&encoded_struct_mutations).unwrap();

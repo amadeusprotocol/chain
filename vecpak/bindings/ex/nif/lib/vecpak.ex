@@ -4,5 +4,6 @@ defmodule VecPak do
     crate: :vecpak_ex_nif
 
   def encode(_term), do: :erlang.nif_error(:nif_not_loaded)
-  def decode(_binary), do: :erlang.nif_error(:nif_not_loaded)
+  def decode(binary), do: decode(binary, %{})
+  def decode(_binary, _opts), do: :erlang.nif_error(:nif_not_loaded)
 end

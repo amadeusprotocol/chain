@@ -1,17 +1,45 @@
 use rustler::types::{tuple, map::{MapIterator}, BigInt, Binary, OwnedBinary};
 use rustler::{
-    Atom, Decoder, Encoder, Env, Error, Term
+    Atom, Decoder, Encoder, Env, Error, Term, TermType
 };
-use num_traits::ToPrimitive;
-use vecpak::{ encode_varint, decode_varint };
+use num_bigint::Sign;
+use vecpak::{ encode_varint, encode_varint_bytes, decode_varint, decode_varint_raw, Limits };
+
+pub use vecpak::Limits as VecpakLimits;
+
+const PREALLOC_CAP: usize = 4096;
+
+pub fn parse_limits(opts: Term) -> Result<Limits, Error> {
+    let mut limits = Limits::default();
+    let iter = opts
+        .decode::<MapIterator>()
+        .map_err(|_| Error::Atom("opts_not_a_map"))?;
+    for (k, v) in iter {
+        let key = k
+            .atom_to_string()
+            .or_else(|_| {
+                Binary::from_term(k).map(|b| String::from_utf8_lossy(b.as_slice()).into_owned())
+            })
+            .map_err(|_| Error::Atom("opt_key_not_atom_or_string"))?;
+        let val = v
+            .decode::<i64>()
+            .map_err(|_| Error::Atom("opt_value_not_integer"))?;
+        if val < 0 {
+            return Err(Error::Atom("opt_value_negative"));
+        }
+        limits
+            .set(&key, val as usize)
+            .map_err(|_| Error::Atom("unknown_opt"))?;
+    }
+    Ok(limits)
+}
 
 #[inline(always)]
 fn decode_varint_ex(buf: &[u8], i: &mut usize) -> Result<i128, Error> {
     decode_varint(buf, i).map_err(|e| Error::Atom(e))
 }
 
-//pub fn encode_term(env: Env, buf: &mut Vec<u8>, term: Term) -> NifResult<()> {
-pub fn encode_term(env: Env, buf: &mut Vec<u8>, term: Term) -> Result<(), Error> {
+pub fn encode_term(env: Env, buf: &mut Vec<u8>, term: Term, depth: usize) -> Result<(), Error> {
     // ---- nil (tag 0) ----
     if rustler::types::atom::nil().eq(&term) {
         buf.push(0);
@@ -23,23 +51,16 @@ pub fn encode_term(env: Env, buf: &mut Vec<u8>, term: Term) -> Result<(), Error>
         return Ok(())
     }
     // ---- VarInt (tag 3) ----
-    if let Ok(i) = term.decode::<i64>() {
-        buf.push(3);
-        encode_varint(buf, i as i128);
-        return Ok(())
-    }
-    if let Ok(i) = term.decode::<u64>() {
-        buf.push(3);
-        encode_varint(buf, i as i128);
-        return Ok(())
-    }
-    if let Ok(bi) = BigInt::decode(term) {
-        if let Some(i) = bi.to_i128() {
+    if term.get_type() == TermType::Integer {
+        if let Ok(bi) = BigInt::decode(term) {
             buf.push(3);
-            encode_varint(buf, i);
-            return Ok(())
-        } else {
-            return Err(Error::BadArg);
+            let (sign, mag) = bi.to_bytes_be();
+            match sign {
+                Sign::NoSign => buf.push(0),
+                Sign::Minus => encode_varint_bytes(buf, true, &mag).map_err(Error::Atom)?,
+                Sign::Plus => encode_varint_bytes(buf, false, &mag).map_err(Error::Atom)?,
+            }
+            return Ok(());
         }
     }
     // ---- Binary (tag 5) OR Atom (tag 5) ----
@@ -58,26 +79,40 @@ pub fn encode_term(env: Env, buf: &mut Vec<u8>, term: Term) -> Result<(), Error>
 
     // ---- Map (tag 7) ----
     if let Ok(iter) = term.decode::<MapIterator>() {
+        if depth + 1 > Limits::default().max_depth {
+            return Err(Error::Atom("depth_limit_exceeded"));
+        }
+        if term.map_size()? > Limits::default().max_container_len {
+            return Err(Error::Atom("container_too_large"));
+        }
         buf.push(7);
         encode_varint(buf, term.map_size()? as i128);
 
         let mut keyed: Vec<(Vec<u8>, Term)> = Vec::with_capacity(iter.size_hint().0);
         for (k, v) in iter {
             let mut kbytes = Vec::with_capacity(32);
-            encode_term(env, &mut kbytes, k)?;
+            encode_term(env, &mut kbytes, k, depth + 1)?;
             keyed.push((kbytes, v));
         }
         keyed.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        if keyed.windows(2).any(|w| w[0].0 == w[1].0) {
+            return Err(Error::Atom("duplicate_map_key"));
+        }
         for (kbytes, v) in keyed {
             buf.extend_from_slice(&kbytes);
-            encode_term(env, buf, v)?;
+            encode_term(env, buf, v, depth + 1)?;
         }
         return Ok(());
     }
 
     // ---- PropList (tag 7) ----
     if let Ok(mut it) = term.into_list_iterator() {
-        // Peek first element to decide if it's a proplist
+        if depth + 1 > Limits::default().max_depth {
+            return Err(Error::Atom("depth_limit_exceeded"));
+        }
+        if (term.list_length()? as usize) > Limits::default().max_container_len {
+            return Err(Error::Atom("container_too_large"));
+        }
         let mut tmp_pairs: Vec<(Term, Term)> = Vec::new();
         let mut is_proplist = term.list_length()? > 0;
 
@@ -97,22 +132,24 @@ pub fn encode_term(env: Env, buf: &mut Vec<u8>, term: Term) -> Result<(), Error>
             let mut keyed: Vec<(Vec<u8>, Term)> = Vec::with_capacity(tmp_pairs.len());
             for (k, v) in tmp_pairs {
                 let mut kbytes = Vec::with_capacity(32);
-                encode_term(env, &mut kbytes, k)?;
+                encode_term(env, &mut kbytes, k, depth + 1)?;
                 keyed.push((kbytes, v));
             }
             keyed.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+            if keyed.windows(2).any(|w| w[0].0 == w[1].0) {
+                return Err(Error::Atom("duplicate_map_key"));
+            }
             for (kbytes, v) in keyed {
                 buf.extend_from_slice(&kbytes);
-                encode_term(env, buf, v)?;
+                encode_term(env, buf, v, depth + 1)?;
             }
             return Ok(());
         } else {
-            // Not a proplist (tag 6)
             buf.push(6);
             encode_varint(buf, term.list_length()? as i128);
             let it = term.into_list_iterator().expect("list_iterator");
             for v in it {
-                encode_term(env, buf, v)?;
+                encode_term(env, buf, v, depth + 1)?;
             }
             return Ok(());
         }
@@ -120,10 +157,16 @@ pub fn encode_term(env: Env, buf: &mut Vec<u8>, term: Term) -> Result<(), Error>
 
     // ---- Tuple (encode as list 6) ----
     if let Ok(tpl) = tuple::get_tuple(term) {
+        if depth + 1 > Limits::default().max_depth {
+            return Err(Error::Atom("depth_limit_exceeded"));
+        }
+        if tpl.len() > Limits::default().max_container_len {
+            return Err(Error::Atom("container_too_large"));
+        }
         buf.push(6);
         encode_varint(buf, tpl.len() as i128);
         for v in tpl {
-            encode_term(env, buf, v)?;
+            encode_term(env, buf, v, depth + 1)?;
         }
         return Ok(());
     }
@@ -154,17 +197,39 @@ fn read_exact<'a>(buf: &'a [u8], i: &mut usize, n: usize) -> Result<&'a [u8], Er
     Ok(s)
 }
 
-//RDB.vecpak_decode(<<7, 1, 3, 5, 1, 2, 122, 97, 3, 1, 4, 5, 1, 3, 97, 102, 97, 5, 1, 4, 116, 101, 115, 116, 5, 1, 3, 98, 122, 122, 5, 1, 4, 98, 101, 115, 116>>)
-pub fn decode_term<'a>(env: Env<'a>, buf: &[u8], i: &mut usize) -> Result<Term<'a>, Error> {
+#[inline]
+fn account_container(count: usize, remaining: usize, limits: &Limits) -> Result<usize, Error> {
+    if count > limits.max_container_len {
+        return Err(Error::Atom("container_too_large"));
+    }
+    if count > remaining {
+        return Err(Error::Atom("count_exceeds_input"));
+    }
+    Ok(count.min(PREALLOC_CAP))
+}
+
+pub fn decode_term<'a>(
+    env: Env<'a>,
+    buf: &[u8],
+    i: &mut usize,
+    limits: &Limits,
+    depth: usize,
+) -> Result<Term<'a>, Error> {
     let tag = read_u8(buf, i)?;
     match tag {
         0 => { Ok(rustler::types::atom::nil().encode(env)) }
         1 => { Ok(true.encode(env)) }
         2 => { Ok(false.encode(env)) }
         3 => {
-            let v = decode_varint_ex(buf, i)?;
-            let term = v.encode(env);
-            Ok(term)
+            let (negative, mag) = decode_varint_raw(buf, i).map_err(Error::Atom)?;
+            let sign = if mag.is_empty() {
+                Sign::NoSign
+            } else if negative {
+                Sign::Minus
+            } else {
+                Sign::Plus
+            };
+            Ok(BigInt::from_bytes_be(sign, mag).encode(env))
         }
         5 => {
             let len = decode_varint_gt_zero(buf, i)?;
@@ -176,14 +241,24 @@ pub fn decode_term<'a>(env: Env<'a>, buf: &[u8], i: &mut usize) -> Result<Term<'
         }
         6 => {
             let count = decode_varint_gt_zero(buf, i)?;
-            let mut items: Vec<Term> = Vec::with_capacity(count);
+            let cap = account_container(count, buf.len().saturating_sub(*i), limits)?;
+            let depth = depth + 1;
+            if depth > limits.max_depth {
+                return Err(Error::Atom("depth_limit_exceeded"));
+            }
+            let mut items: Vec<Term> = Vec::with_capacity(cap);
             for _ in 0..count {
-                items.push(decode_term(env, buf, i)?);
+                items.push(decode_term(env, buf, i, limits, depth)?);
             }
             Ok(items.encode(env))
         }
         7 => {
             let count = decode_varint_gt_zero(buf, i)?;
+            account_container(count, buf.len().saturating_sub(*i), limits)?;
+            let depth = depth + 1;
+            if depth > limits.max_depth {
+                return Err(Error::Atom("depth_limit_exceeded"));
+            }
             let mut map = rustler::types::map::map_new(env);
 
             //Canonical check
@@ -191,7 +266,7 @@ pub fn decode_term<'a>(env: Env<'a>, buf: &[u8], i: &mut usize) -> Result<Term<'
 
             for _ in 0..count {
                 let k_start = *i;
-                let k = decode_term(env, buf, i)?;
+                let k = decode_term(env, buf, i, limits, depth)?;
                 let k_bytes = &buf[k_start..*i];
 
                 if let Some(prev) = prev_key_bytes {
@@ -199,14 +274,18 @@ pub fn decode_term<'a>(env: Env<'a>, buf: &[u8], i: &mut usize) -> Result<Term<'
                 }
                 prev_key_bytes = Some(k_bytes);
 
-                let v = decode_term(env, buf, i)?;
+                let v = decode_term(env, buf, i, limits, depth)?;
 
-                //Put keys as atom if they exist in atom table
                 if let Ok(bin) = Binary::from_term(k) {
-                    if let Ok(Some(atom)) = Atom::try_from_bytes(env, bin.as_slice()) {
-                        map = map.map_put(atom, v)?;
+                    let bytes = bin.as_slice();
+                    let atom = if matches!(bytes, b"nil" | b"true" | b"false") {
+                        None
                     } else {
-                        map = map.map_put(k, v)?;
+                        Atom::try_from_bytes(env, bytes).ok().flatten()
+                    };
+                    match atom {
+                        Some(a) => map = map.map_put(a, v)?,
+                        None => map = map.map_put(k, v)?,
                     }
                 } else {
                     map = map.map_put(k, v)?;
@@ -218,9 +297,13 @@ pub fn decode_term<'a>(env: Env<'a>, buf: &[u8], i: &mut usize) -> Result<Term<'
     }
 }
 
-pub fn decode_term_from_slice<'a>(env: Env<'a>, buf: &[u8]) -> Result<Term<'a>, Error> {
+pub fn decode_term_from_slice<'a>(
+    env: Env<'a>,
+    buf: &[u8],
+    limits: &Limits,
+) -> Result<Term<'a>, Error> {
     let mut i = 0;
-    let term = decode_term(env, buf, &mut i)?;
+    let term = decode_term(env, buf, &mut i, limits, 0)?;
     if i != buf.len() { return Err(Error::Atom("trailing_bytes")); }
     Ok(term)
 }
